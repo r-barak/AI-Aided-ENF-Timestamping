@@ -1,13 +1,10 @@
 from pathlib import Path
 from tqdm import tqdm
-from multiprocessing import Pool, cpu_count
-import scipy.signal as sig
+import multiprocessing as mp
 from scipy.io import wavfile
 from scipy.signal import resample_poly, firwin, spectrogram, filtfilt
 from scipy.signal.windows import get_window
-from scipy.ndimage.filters import gaussian_filter1d
 import numpy as np
-from scipy.ndimage import correlate
 from scipy.signal import convolve as fftconvolve
 
 ############################################
@@ -140,20 +137,6 @@ def calc_nm_array(t, r, eps=1e-12):
 ############################################
 # 1. Signal Preprocessing
 ############################################
-def split_signal(signal, sample_rate, duration_min, overlap_min):
-    """
-    Splits a long signal into overlapping segments.
-    """
-    segment_length = int(duration_min * 60 * sample_rate)
-    overlap_length = int(overlap_min * 60 * sample_rate)
-
-    sub_signals = []
-    # Slide a window across the signal
-    for start in range(0, len(signal) - segment_length + 1, overlap_length):
-        end = start + segment_length
-        sub_signals.append((start, end, signal[start:end]))
-    return sub_signals
-
 def process_file(data_args):
     """
     Worker function: Loads audio, converts to mono, resamples, and saves segments.
@@ -182,24 +165,93 @@ def process_file(data_args):
             np.savez_compressed(out_path, signal=data_resampled, sample_rate=args['fs'])
         else:
             # Target recordings (Queries) are split into various lengths
-            for dur in DURATIONS_MINUTES:
-                segments = split_signal(data_resampled, args['fs'], dur, args['overlap_min'])
-                for start_idx, end_idx, segment in segments:
-                    segment_name = f"{base_name}_{start_idx}_{end_idx}.npz"
-                    out_path = os.path.join(signal_folder, segment_name)
-                    np.savez_compressed(out_path, signal=segment, sample_rate=args['fs'])
+            step = int(args['overlap_min'] * 60 * args['fs'])
+            for dur in args['segment_dur']:
+                seg_len = int(dur * 60 * args['fs'])
+                for start_idx in range(0, len(data_resampled) - seg_len + 1, step):
+                    end_idx = start_idx + seg_len
+                    out_path = os.path.join(signal_folder, f"{base_name}_{start_idx}_{end_idx}.npz")
+                    np.savez_compressed(out_path, signal=data_resampled[start_idx:end_idx], sample_rate=args['fs'])
 
     except Exception as e:
         print(f"Failed to process {file_path}: {e}")
 
-def process_directory_parallel(input_dir, output_dir, is_reference):
+def process_file(data_args: tuple) -> None:
+    """
+    Worker function: Loads audio, converts to mono, resamples, and saves segments.
+    """
+    (file_path, output_dir, is_reference, target_fs, overlap_min, segment_durations) = data_args
+    # file_path, output_dir = Path(file_path), Path(output_dir)
+
+    try:
+        sample_rate, data = wavfile.read(file_path)
+
+        # Convert stereo to mono by averaging channels
+        if data.ndim > 1:
+            data = data.mean(axis=1).astype(data.dtype)
+
+        # Resample from 'sample_rate' to 'target_fs'
+        data_resampled = resample_poly(data, up=target_fs, down=sample_rate)
+        data_resampled = data_resampled.astype(np.float32)
+
+        base_name = file_path.stem 
+        signal_folder = output_dir / base_name
+        signal_folder.mkdir(parents=True, exist_ok=True)
+
+        if is_reference:
+            # Reference recordings are saved whole
+            out_path = signal_folder / f"{base_name}.npz"
+            np.savez_compressed(out_path, signal=data_resampled, sample_rate=target_fs)
+        else:
+            # Target recordings are split incrementally
+            step = int(overlap_min * 60 * target_fs)
+            
+            for dur in segment_durations:
+                seg_len = int(dur * 60 * target_fs)
+                
+                for start_idx in range(0, len(data_resampled) - seg_len + 1, step):
+                    end_idx = start_idx + seg_len
+                    out_path = signal_folder / f"{base_name}_{start_idx}_{end_idx}.npz"
+                    
+                    np.savez_compressed(
+                        out_path, 
+                        signal=data_resampled[start_idx:end_idx], 
+                        sample_rate=target_fs
+                    )
+
+    except Exception as e:
+        print(f"Failed to process {file_path.name}: {e}")
+
+def process_directory_parallel(
+    input_dir: str, 
+    output_dir: str, 
+    is_reference: bool,
+    supported_ext: str | tuple,
+    target_fs: int,
+    overlap_min: float,
+    segment_durations: list[float]
+) -> None:
     """
     Parallel processing of all audio recording files in a directory.
     """
-    files = [os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith(args['supported_ext'])]
-    args_list = [(file_path, output_dir, is_reference) for file_path in files]
+    input_path, output_path = Path(input_dir), Path(output_dir)
 
-    with Pool(cpu_count()) as pool:
-        list(tqdm(pool.imap_unordered(process_file, args_list), total=len(args_list), desc="Processing"))
+    files = [
+        f for f in input_path.iterdir() 
+        if f.is_file() and f.name.endswith(supported_ext)
+    ]
+
+    args_list = [
+        (f, output_path, is_reference, target_fs, overlap_min, segment_durations) 
+        for f in files
+    ]
+
+    num_cores = max(1, mp.cpu_count() - 1) # Leave 1 CPU core free so your OS doesn't freeze
+    with mp.Pool(num_cores) as pool:
+        list(tqdm(
+            pool.imap_unordered(process_file, args_list), 
+            total=len(args_list), 
+            desc=f"Processing {'References' if is_reference else 'Queries'}"
+        ))
 
 ############################################
